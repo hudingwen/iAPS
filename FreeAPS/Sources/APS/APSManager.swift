@@ -23,6 +23,7 @@ protocol APSManager {
     var bolusProgress: CurrentValueSubject<Decimal?, Never> { get }
     var pumpExpiresAtDate: CurrentValueSubject<Date?, Never> { get }
     var isManualTempBasal: Bool { get }
+    var bolusAmount: CurrentValueSubject<Decimal?, Never> { get }
     func enactTempBasal(rate: Double, duration: TimeInterval)
     func makeProfiles() -> AnyPublisher<Bool, Never>
     func determineBasal() -> AnyPublisher<Bool, Never>
@@ -36,6 +37,7 @@ protocol APSManager {
 enum APSError: LocalizedError {
     case pumpError(Error)
     case invalidPumpState(message: String)
+    case bolusInProgress(message: String)
     case glucoseError(message: String)
     case apsError(message: String)
     case deviceSyncError(message: String)
@@ -47,6 +49,8 @@ enum APSError: LocalizedError {
             return "Pump error: \(error.localizedDescription)"
         case let .invalidPumpState(message):
             return "Error: Invalid Pump State: \(message)"
+        case let .bolusInProgress(message):
+            return "Error: Pump is Busy. \(message)"
         case let .glucoseError(message):
             return "Error: Invalid glucose: \(message)"
         case let .apsError(message):
@@ -72,7 +76,6 @@ final class BaseAPSManager: APSManager, Injectable {
     @Injected() private var nightscout: NightscoutManager!
     @Injected() private var settingsManager: SettingsManager!
     @Injected() private var broadcaster: Broadcaster!
-    @Injected() private var healthKitManager: HealthKitManager!
     @Persisted(key: "lastAutotuneDate") private var lastAutotuneDate = Date()
     @Persisted(key: "lastStartLoopDate") private var lastStartLoopDate: Date = .distantPast
     @Persisted(key: "lastLoopDate") var lastLoopDate: Date = .distantPast {
@@ -101,8 +104,8 @@ final class BaseAPSManager: APSManager, Injectable {
     let isLooping = CurrentValueSubject<Bool, Never>(false)
     let lastLoopDateSubject = PassthroughSubject<Date, Never>()
     let lastError = CurrentValueSubject<Error?, Never>(nil)
-
     let bolusProgress = CurrentValueSubject<Decimal?, Never>(nil)
+    let bolusAmount = CurrentValueSubject<Decimal?, Never>(nil)
 
     var pumpDisplayState: CurrentValueSubject<PumpDisplayState?, Never> {
         deviceDataManager.pumpDisplayState
@@ -123,7 +126,7 @@ final class BaseAPSManager: APSManager, Injectable {
 
     init(resolver: Resolver) {
         injectServices(resolver)
-        openAPS = OpenAPS(storage: storage)
+        openAPS = OpenAPS(storage: storage, nightscout: nightscout)
         subscribe()
         lastLoopDateSubject.send(lastLoopDate)
 
@@ -268,10 +271,6 @@ final class BaseAPSManager: APSManager, Injectable {
     private func loopCompleted(error: Error? = nil, loopStatRecord: LoopStats) {
         isLooping.send(false)
 
-        // save AH events
-        let events = pumpHistoryStorage.recent()
-        healthKitManager.saveIfNeeded(pumpEvents: events)
-
         if let error = error {
             warning(.apsManager, "Loop failed with error: \(error.localizedDescription)")
             if let backgroundTask = backGroundTaskID {
@@ -305,7 +304,10 @@ final class BaseAPSManager: APSManager, Injectable {
         let status = pump.status.pumpStatus
 
         guard !status.bolusing else {
-            return APSError.invalidPumpState(message: "Pump is bolusing")
+            return APSError
+                .bolusInProgress(
+                    message: "Can't enact the new loop cycle recommendation, because a Bolus is in progress. Wait for next loop cycle"
+                )
         }
 
         guard !status.suspended else {
@@ -347,10 +349,13 @@ final class BaseAPSManager: APSManager, Injectable {
             return Just(false).eraseToAnyPublisher()
         }
 
-        guard glucoseStorage.isGlucoseNotFlat() else {
-            debug(.apsManager, "Glucose data is too flat")
-            processError(APSError.glucoseError(message: "Glucose data is too flat"))
-            return Just(false).eraseToAnyPublisher()
+        // Only let glucose be flat when 400 mg/dl
+        if (glucoseStorage.recent().last?.glucose ?? 100) != 400 {
+            guard glucoseStorage.isGlucoseNotFlat() else {
+                debug(.apsManager, "Glucose data is too flat")
+                processError(APSError.glucoseError(message: "Glucose data is too flat"))
+                return Just(false).eraseToAnyPublisher()
+            }
         }
 
         let now = Date()
@@ -451,6 +456,7 @@ final class BaseAPSManager: APSManager, Injectable {
                     self.determineBasal().sink { _ in }.store(in: &self.lifetime)
                 }
                 self.bolusProgress.send(0)
+                self.bolusAmount.send(Decimal(roundedAmout))
             }
         } receiveValue: { _ in }
             .store(in: &lifetime)
@@ -558,9 +564,13 @@ final class BaseAPSManager: APSManager, Injectable {
                     }
 
                 } else {
-                    debug(.apsManager, "Announcement Bolus succeeded")
+                    debug(
+                        .apsManager,
+                        "Announcement Bolus succeeded."
+                    )
                     self.announcementsStorage.storeAnnouncements([announcement], enacted: true)
                     self.bolusProgress.send(0)
+                    self.bolusAmount.send(Decimal(roundedAmount))
                 }
             }
         case let .pump(pumpAction):
@@ -615,10 +625,76 @@ final class BaseAPSManager: APSManager, Injectable {
                 if let error = error {
                     warning(.apsManager, "Announcement TempBasal failed with error: \(error.localizedDescription)")
                 } else {
-                    debug(.apsManager, "Announcement TempBasal succeeded")
+                    debug(
+                        .apsManager,
+                        "Announcement TempBasal succeeded."
+                    )
                     self.announcementsStorage.storeAnnouncements([announcement], enacted: true)
                 }
             }
+        case let .meal(carbs, fat, protein):
+            let date = announcement.createdAt.date
+
+            guard carbs > 0 || fat > 0 || protein > 0 else {
+                return
+            }
+
+            carbsStorage.storeCarbs([CarbsEntry(
+                id: UUID().uuidString,
+                createdAt: date,
+                actualDate: date,
+                carbs: carbs,
+                fat: fat,
+                protein: protein,
+                note: "Remote",
+                enteredBy: "Nightscout operator",
+                isFPU: fat > 0 || protein > 0,
+                fpuID: (fat > 0 || protein > 0) ? UUID().uuidString : nil
+            )])
+
+            announcementsStorage.storeAnnouncements([announcement], enacted: true)
+            debug(
+                .apsManager,
+                "Remote Meal by Announcement succeeded. Carbs: \(carbs), fat: \(fat), protein: \(protein)."
+            )
+        case let .override(name):
+            guard !name.isEmpty else { return }
+            let storage = OverrideStorage()
+            let lastActiveOveride = storage.fetchLatestOverride().first
+            let isActive = lastActiveOveride?.enabled ?? false
+
+            // Command to Cancel Active Override
+            if name.lowercased() == "cancel", isActive {
+                if let activeOveride = lastActiveOveride {
+                    let presetName = storage.isPresetName()
+                    let nsString = presetName != nil ? presetName : activeOveride.percentage.formatted()
+
+                    if let duration = storage.cancelProfile() {
+                        nightscout.editOverride(nsString!, duration, activeOveride.date ?? Date.now)
+                    }
+                    announcementsStorage.storeAnnouncements([announcement], enacted: true)
+                    debug(.apsManager, "Override Canceled by Announcement succeeded.")
+                }
+                return
+            }
+
+            // Cancel eventual current active override first
+            if isActive {
+                if let duration = OverrideStorage().cancelProfile(), let last = lastActiveOveride {
+                    let presetName = storage.isPresetName()
+                    let nsString = presetName != nil ? presetName : last.percentage.formatted()
+                    nightscout.editOverride(nsString!, duration, last.date ?? Date())
+                }
+            }
+
+            // Activate the new override and uplad the new ovderride to NS. Some duplicate code now. Needs refactoring.
+            let preset = storage.fetchPreset(name)
+            guard let id = preset.id, let preset_ = preset.preset else { return }
+            storage.overrideFromPreset(preset_, id)
+            let currentActiveOveride = storage.fetchLatestOverride().first
+            nightscout.uploadOverride(name, Double(preset.preset?.duration ?? 0), currentActiveOveride?.date ?? Date.now)
+            announcementsStorage.storeAnnouncements([announcement], enacted: true)
+            debug(.apsManager, "Remote Override by Announcement succeeded.")
         }
     }
 
@@ -695,6 +771,7 @@ final class BaseAPSManager: APSManager, Injectable {
             }
             return pump.enactBolus(units: Double(units), automatic: true).map { _ in
                 self.bolusProgress.send(0)
+                self.bolusAmount.send(units)
                 return ()
             }
             .eraseToAnyPublisher()
@@ -710,6 +787,15 @@ final class BaseAPSManager: APSManager, Injectable {
             enacted.recieved = received
 
             storage.save(enacted, as: OpenAPS.Enact.enacted)
+
+            // Save to CoreData also. TO DO: Remove the JSON saving after some testing.
+            coredataContext.perform {
+                let saveLastLoop = LastLoop(context: self.coredataContext)
+                saveLastLoop.iob = (enacted.iob ?? 0) as NSDecimalNumber
+                saveLastLoop.cob = (enacted.cob ?? 0) as NSDecimalNumber
+                saveLastLoop.timestamp = (enacted.timestamp ?? .distantPast) as Date
+                try? self.coredataContext.save()
+            }
 
             debug(.apsManager, "Suggestion enacted. Received: \(received)")
             DispatchQueue.main.async {
@@ -732,7 +818,7 @@ final class BaseAPSManager: APSManager, Injectable {
         return rounded
     }
 
-    private func medianCalculation(array: [Double]) -> Double {
+    private func medianCalculationDouble(array: [Double]) -> Double {
         guard !array.isEmpty else {
             return 0
         }
@@ -745,7 +831,138 @@ final class BaseAPSManager: APSManager, Injectable {
         return sorted[length / 2]
     }
 
-    // Add to statistics.JSON
+    private func medianCalculation(array: [Int]) -> Double {
+        guard !array.isEmpty else {
+            return 0
+        }
+        let sorted = array.sorted()
+        let length = array.count
+
+        if length % 2 == 0 {
+            return Double((sorted[length / 2 - 1] + sorted[length / 2]) / 2)
+        }
+        return Double(sorted[length / 2])
+    }
+
+    private func tir(_ array: [Readings]) -> (TIR: Double, hypos: Double, hypers: Double, normal_: Double) {
+        let glucose = array
+        let justGlucoseArray = glucose.compactMap({ each in Int(each.glucose as Int16) })
+        let totalReadings = justGlucoseArray.count
+        let highLimit = settingsManager.settings.high
+        let lowLimit = settingsManager.settings.low
+        let hyperArray = glucose.filter({ $0.glucose >= Int(highLimit) })
+        let hyperReadings = hyperArray.compactMap({ each in each.glucose as Int16 }).count
+        let hyperPercentage = Double(hyperReadings) / Double(totalReadings) * 100
+        let hypoArray = glucose.filter({ $0.glucose <= Int(lowLimit) })
+        let hypoReadings = hypoArray.compactMap({ each in each.glucose as Int16 }).count
+        let hypoPercentage = Double(hypoReadings) / Double(totalReadings) * 100
+        // Euglyccemic range
+        let normalArray = glucose.filter({ $0.glucose >= 70 && $0.glucose <= 140 })
+        let normalReadings = normalArray.compactMap({ each in each.glucose as Int16 }).count
+        let normalPercentage = Double(normalReadings) / Double(totalReadings) * 100
+        // TIR
+        let tir = 100 - (hypoPercentage + hyperPercentage)
+        return (
+            roundDouble(tir, 1),
+            roundDouble(hypoPercentage, 1),
+            roundDouble(hyperPercentage, 1),
+            roundDouble(normalPercentage, 1)
+        )
+    }
+
+    private func glucoseStats(_ fetchedGlucose: [Readings])
+        -> (ifcc: Double, ngsp: Double, average: Double, median: Double, sd: Double, cv: Double, readings: Double)
+    {
+        let glucose = fetchedGlucose
+        // First date
+        let last = glucose.last?.date ?? Date()
+        // Last date (recent)
+        let first = glucose.first?.date ?? Date()
+        // Total time in days
+        let numberOfDays = (first - last).timeInterval / 8.64E4
+        let denominator = numberOfDays < 1 ? 1 : numberOfDays
+        let justGlucoseArray = glucose.compactMap({ each in Int(each.glucose as Int16) })
+        let sumReadings = justGlucoseArray.reduce(0, +)
+        let countReadings = justGlucoseArray.count
+        let glucoseAverage = Double(sumReadings) / Double(countReadings)
+        let medianGlucose = medianCalculation(array: justGlucoseArray)
+        var NGSPa1CStatisticValue = 0.0
+        var IFCCa1CStatisticValue = 0.0
+
+        NGSPa1CStatisticValue = (glucoseAverage + 46.7) / 28.7 // NGSP (%)
+        IFCCa1CStatisticValue = 10.929 *
+            (NGSPa1CStatisticValue - 2.152) // IFCC (mmol/mol)  A1C(mmol/mol) = 10.929 * (A1C(%) - 2.15)
+        var sumOfSquares = 0.0
+
+        for array in justGlucoseArray {
+            sumOfSquares += pow(Double(array) - Double(glucoseAverage), 2)
+        }
+        var sd = 0.0
+        var cv = 0.0
+        // Avoid division by zero
+        if glucoseAverage > 0 {
+            sd = sqrt(sumOfSquares / Double(countReadings))
+            cv = sd / Double(glucoseAverage) * 100
+        }
+        let conversionFactor = 0.0555
+        let units = settingsManager.settings.units
+
+        var output: (ifcc: Double, ngsp: Double, average: Double, median: Double, sd: Double, cv: Double, readings: Double)
+        output = (
+            ifcc: IFCCa1CStatisticValue,
+            ngsp: NGSPa1CStatisticValue,
+            average: glucoseAverage * (units == .mmolL ? conversionFactor : 1),
+            median: medianGlucose * (units == .mmolL ? conversionFactor : 1),
+            sd: sd * (units == .mmolL ? conversionFactor : 1), cv: cv,
+            readings: Double(countReadings) / denominator
+        )
+        return output
+    }
+
+    private func loops(_ fetchedLoops: [LoopStatRecord]) -> Loops {
+        let loops = fetchedLoops
+        // First date
+        let previous = loops.last?.end ?? Date()
+        // Last date (recent)
+        let current = loops.first?.start ?? Date()
+        // Total time in days
+        let totalTime = (current - previous).timeInterval / 8.64E4
+        //
+        let durationArray = loops.compactMap({ each in each.duration })
+        let durationArrayCount = durationArray.count
+        let durationAverage = durationArray.reduce(0, +) / Double(durationArrayCount) * 60
+        let medianDuration = medianCalculationDouble(array: durationArray) * 60
+        let max_duration = (durationArray.max() ?? 0) * 60
+        let min_duration = (durationArray.min() ?? 0) * 60
+        let successsNR = loops.compactMap({ each in each.loopStatus }).filter({ each in each!.contains("Success") }).count
+        let errorNR = durationArrayCount - successsNR
+        let total = Double(successsNR + errorNR) == 0 ? 1 : Double(successsNR + errorNR)
+        let successRate: Double? = (Double(successsNR) / total) * 100
+        let loopNr = totalTime <= 1 ? total : round(total / (totalTime != 0 ? totalTime : 1))
+        let intervalArray = loops.compactMap({ each in each.interval as Double })
+        let count = intervalArray.count != 0 ? intervalArray.count : 1
+        let median_interval = medianCalculationDouble(array: intervalArray)
+        let intervalAverage = intervalArray.reduce(0, +) / Double(count)
+        let maximumInterval = intervalArray.max()
+        let minimumInterval = intervalArray.min()
+        //
+        let output = Loops(
+            loops: Int(loopNr),
+            errors: errorNR,
+            success_rate: roundDecimal(Decimal(successRate ?? 0), 1),
+            avg_interval: roundDecimal(Decimal(intervalAverage), 1),
+            median_interval: roundDecimal(Decimal(median_interval), 1),
+            min_interval: roundDecimal(Decimal(minimumInterval ?? 0), 1),
+            max_interval: roundDecimal(Decimal(maximumInterval ?? 0), 1),
+            avg_duration: roundDecimal(Decimal(durationAverage), 1),
+            median_duration: roundDecimal(Decimal(medianDuration), 1),
+            min_duration: roundDecimal(Decimal(min_duration), 1),
+            max_duration: roundDecimal(Decimal(max_duration), 1)
+        )
+        return output
+    }
+
+    // Add to statistics.JSON for upload to NS.
     private func statistics() {
         let now = Date()
         if settingsManager.settings.uploadStats {
@@ -753,543 +970,275 @@ final class BaseAPSManager: APSManager, Injectable {
             guard hour > 20 else {
                 return
             }
+
+            let stats = CoreDataStorage().fetchStats()
+            // Only save and upload once per day
+            guard (-1 * (stats.first?.lastrun ?? .distantPast).timeIntervalSinceNow.hours) > 22 else { return }
+
+            let units = settingsManager.settings.units
+            let preferences = settingsManager.preferences
+
+            // Carbs
+            let carbs = CoreDataStorage().fetcarbs(interval: DateFilter().day)
+            var carbTotal: Decimal = 0
+            carbTotal = carbs.map({ carbs in carbs.carbs as? Decimal ?? 0 }).reduce(0, +)
+
+            // TDD
+            let tdds = CoreDataStorage().fetchTDD(interval: DateFilter().fourteen)
+            var currentTDD: Decimal = 0
+            var tddTotalAverage: Decimal = 0
+            if !tdds.isEmpty {
+                currentTDD = tdds[0].tdd?.decimalValue ?? 0
+                let tddArray = tdds.compactMap({ insulin in insulin.tdd as? Decimal ?? 0 })
+                tddTotalAverage = tddArray.reduce(0, +) / Decimal(tddArray.count)
+            }
+
+            var algo_ = "Oref0"
+
+            if preferences.sigmoid, preferences.enableDynamicCR {
+                algo_ = "Dynamic ISF + CR: Sigmoid"
+            } else if preferences.sigmoid, !preferences.enableDynamicCR {
+                algo_ = "Dynamic ISF: Sigmoid"
+            } else if preferences.useNewFormula, preferences.enableDynamicCR {
+                algo_ = "Dynamic ISF + CR: Logarithmic"
+            } else if preferences.useNewFormula, !preferences.sigmoid,!preferences.enableDynamicCR {
+                algo_ = "Dynamic ISF: Logarithmic"
+            }
+            let af = preferences.adjustmentFactor
+            let insulin_type = preferences.curve
+            let buildDate = Bundle.main.buildDate
+            let version = Bundle.main.releaseVersionNumber
+            let build = Bundle.main.buildVersionNumber
+
+            // Read branch information from branch.txt instead of infoDictionary
+            var branch = "Unknown"
+            if let branchFileURL = Bundle.main.url(forResource: "branch", withExtension: "txt"),
+               let branchFileContent = try? String(contentsOf: branchFileURL)
+            {
+                let lines = branchFileContent.components(separatedBy: .newlines)
+                for line in lines {
+                    let components = line.components(separatedBy: "=")
+                    if components.count == 2 {
+                        let key = components[0].trimmingCharacters(in: .whitespaces)
+                        let value = components[1].trimmingCharacters(in: .whitespaces)
+
+                        if key == "BRANCH" {
+                            branch = value
+                            break
+                        }
+                    }
+                }
+            } else {
+                branch = "Unknown"
+            }
+
+            let copyrightNotice_ = Bundle.main.infoDictionary?["NSHumanReadableCopyright"] as? String ?? ""
+            let pump_ = pumpManager?.localizedTitle ?? ""
+            let cgm = settingsManager.settings.cgm
+            let file = OpenAPS.Monitor.statistics
+            var iPa: Decimal = 75
+            if preferences.useCustomPeakTime {
+                iPa = preferences.insulinPeakTime
+            } else if preferences.curve.rawValue == "rapid-acting" {
+                iPa = 65
+            } else if preferences.curve.rawValue == "ultra-rapid" {
+                iPa = 50
+            }
+            // CGM Readings
+            let glucose_24 = CoreDataStorage().fetchGlucose(interval: DateFilter().day) // Day
+            let glucose_7 = CoreDataStorage().fetchGlucose(interval: DateFilter().week) // Week
+            let glucose_30 = CoreDataStorage().fetchGlucose(interval: DateFilter().month) // Month
+            let glucose = CoreDataStorage().fetchGlucose(interval: DateFilter().total) // Total
+
+            // First date
+            let previous = glucose.last?.date ?? Date()
+            // Last date (recent)
+            let current = glucose.first?.date ?? Date()
+            // Total time in days
+            let numberOfDays = (current - previous).timeInterval / 8.64E4
+
+            // Get glucose computations for every case
+            let oneDayGlucose = glucoseStats(glucose_24)
+            let sevenDaysGlucose = glucoseStats(glucose_7)
+            let thirtyDaysGlucose = glucoseStats(glucose_30)
+            let totalDaysGlucose = glucoseStats(glucose)
+
+            let median = Durations(
+                day: roundDecimal(Decimal(oneDayGlucose.median), 1),
+                week: roundDecimal(Decimal(sevenDaysGlucose.median), 1),
+                month: roundDecimal(Decimal(thirtyDaysGlucose.median), 1),
+                total: roundDecimal(Decimal(totalDaysGlucose.median), 1)
+            )
+
+            let overrideHbA1cUnit = settingsManager.settings.overrideHbA1cUnit
+
+            let hbs = Durations(
+                day: ((units == .mmolL && !overrideHbA1cUnit) || (units == .mgdL && overrideHbA1cUnit)) ?
+                    roundDecimal(Decimal(oneDayGlucose.ifcc), 1) : roundDecimal(Decimal(oneDayGlucose.ngsp), 1),
+                week: ((units == .mmolL && !overrideHbA1cUnit) || (units == .mgdL && overrideHbA1cUnit)) ?
+                    roundDecimal(Decimal(sevenDaysGlucose.ifcc), 1) : roundDecimal(Decimal(sevenDaysGlucose.ngsp), 1),
+                month: ((units == .mmolL && !overrideHbA1cUnit) || (units == .mgdL && overrideHbA1cUnit)) ?
+                    roundDecimal(Decimal(thirtyDaysGlucose.ifcc), 1) : roundDecimal(Decimal(thirtyDaysGlucose.ngsp), 1),
+                total: ((units == .mmolL && !overrideHbA1cUnit) || (units == .mgdL && overrideHbA1cUnit)) ?
+                    roundDecimal(Decimal(totalDaysGlucose.ifcc), 1) : roundDecimal(Decimal(totalDaysGlucose.ngsp), 1)
+            )
+
+            var oneDay_: (TIR: Double, hypos: Double, hypers: Double, normal_: Double) = (0.0, 0.0, 0.0, 0.0)
+            var sevenDays_: (TIR: Double, hypos: Double, hypers: Double, normal_: Double) = (0.0, 0.0, 0.0, 0.0)
+            var thirtyDays_: (TIR: Double, hypos: Double, hypers: Double, normal_: Double) = (0.0, 0.0, 0.0, 0.0)
+            var totalDays_: (TIR: Double, hypos: Double, hypers: Double, normal_: Double) = (0.0, 0.0, 0.0, 0.0)
+            // Get TIR computations for every case
+            oneDay_ = tir(glucose_24)
+            sevenDays_ = tir(glucose_7)
+            thirtyDays_ = tir(glucose_30)
+            totalDays_ = tir(glucose)
+
+            let tir = Durations(
+                day: roundDecimal(Decimal(oneDay_.TIR), 1),
+                week: roundDecimal(Decimal(sevenDays_.TIR), 1),
+                month: roundDecimal(Decimal(thirtyDays_.TIR), 1),
+                total: roundDecimal(Decimal(totalDays_.TIR), 1)
+            )
+            let hypo = Durations(
+                day: Decimal(oneDay_.hypos),
+                week: Decimal(sevenDays_.hypos),
+                month: Decimal(thirtyDays_.hypos),
+                total: Decimal(totalDays_.hypos)
+            )
+            let hyper = Durations(
+                day: Decimal(oneDay_.hypers),
+                week: Decimal(sevenDays_.hypers),
+                month: Decimal(thirtyDays_.hypers),
+                total: Decimal(totalDays_.hypers)
+            )
+            let normal = Durations(
+                day: Decimal(oneDay_.normal_),
+                week: Decimal(sevenDays_.normal_),
+                month: Decimal(thirtyDays_.normal_),
+                total: Decimal(totalDays_.normal_)
+            )
+            let range = Threshold(
+                low: units == .mmolL ? roundDecimal(settingsManager.settings.low.asMmolL, 1) :
+                    roundDecimal(settingsManager.settings.low, 0),
+                high: units == .mmolL ? roundDecimal(settingsManager.settings.high.asMmolL, 1) :
+                    roundDecimal(settingsManager.settings.high, 0)
+            )
+            let TimeInRange = TIRs(
+                TIR: tir,
+                Hypos: hypo,
+                Hypers: hyper,
+                Threshold: range,
+                Euglycemic: normal
+            )
+            let avgs = Durations(
+                day: roundDecimal(Decimal(oneDayGlucose.average), 1),
+                week: roundDecimal(Decimal(sevenDaysGlucose.average), 1),
+                month: roundDecimal(Decimal(thirtyDaysGlucose.average), 1),
+                total: roundDecimal(Decimal(totalDaysGlucose.average), 1)
+            )
+            let avg = Averages(Average: avgs, Median: median)
+            // Standard Deviations
+            let standardDeviations = Durations(
+                day: roundDecimal(Decimal(oneDayGlucose.sd), 1),
+                week: roundDecimal(Decimal(sevenDaysGlucose.sd), 1),
+                month: roundDecimal(Decimal(thirtyDaysGlucose.sd), 1),
+                total: roundDecimal(Decimal(totalDaysGlucose.sd), 1)
+            )
+            // CV = standard deviation / sample mean x 100
+            let cvs = Durations(
+                day: roundDecimal(Decimal(oneDayGlucose.cv), 1),
+                week: roundDecimal(Decimal(sevenDaysGlucose.cv), 1),
+                month: roundDecimal(Decimal(thirtyDaysGlucose.cv), 1),
+                total: roundDecimal(Decimal(totalDaysGlucose.cv), 1)
+            )
+            let variance = Variance(SD: standardDeviations, CV: cvs)
+
+            // Loops
+            var lsr = [LoopStatRecord]()
+            let requestLSR = LoopStatRecord.fetchRequest() as NSFetchRequest<LoopStatRecord>
+            requestLSR.predicate = NSPredicate(
+                format: "interval > 0 AND start > %@",
+                Date().addingTimeInterval(-24.hours.timeInterval) as NSDate
+            )
+            let sortLSR = NSSortDescriptor(key: "start", ascending: false)
+            requestLSR.sortDescriptors = [sortLSR]
+            try? lsr = coredataContext.fetch(requestLSR)
+            // Compute LoopStats for 24 hours
+            let oneDayLoops = loops(lsr)
+            let loopstat = LoopCycles(
+                loops: oneDayLoops.loops,
+                errors: oneDayLoops.errors,
+                readings: Int(oneDayGlucose.readings),
+                success_rate: oneDayLoops.success_rate,
+                avg_interval: oneDayLoops.avg_interval,
+                median_interval: oneDayLoops.median_interval,
+                min_interval: oneDayLoops.min_interval,
+                max_interval: oneDayLoops.max_interval,
+                avg_duration: oneDayLoops.avg_duration,
+                median_duration: oneDayLoops.median_duration,
+                min_duration: oneDayLoops.max_duration,
+                max_duration: oneDayLoops.max_duration
+            )
+
+            // Insulin
+            let insulinDistribution = CoreDataStorage().fetchInsulinDistribution()
+            var insulin = Ins(
+                TDD: 0,
+                bolus: 0,
+                temp_basal: 0,
+                scheduled_basal: 0,
+                total_average: 0
+            )
+
+            insulin = Ins(
+                TDD: roundDecimal(currentTDD, 2),
+                bolus: insulinDistribution.first != nil ? ((insulinDistribution.first?.bolus ?? 0) as Decimal) : 0,
+                temp_basal: insulinDistribution.first != nil ? ((insulinDistribution.first?.tempBasal ?? 0) as Decimal) : 0,
+                scheduled_basal: insulinDistribution
+                    .first != nil ? ((insulinDistribution.first?.scheduledBasal ?? 0) as Decimal) : 0,
+                total_average: roundDecimal(tddTotalAverage, 1)
+            )
+
+            let hbA1cUnit = !overrideHbA1cUnit ? (units == .mmolL ? "mmol/mol" : "%") : (units == .mmolL ? "%" : "mmol/mol")
+
+            let dailystat = Statistics(
+                created_at: Date(),
+                iPhone: UIDevice.current.getDeviceId,
+                iOS: UIDevice.current.getOSInfo,
+                Build_Version: version ?? "",
+                Build_Number: build ?? "1",
+                Branch: branch,
+                CopyRightNotice: String(copyrightNotice_.prefix(32)),
+                Build_Date: buildDate,
+                Algorithm: algo_,
+                AdjustmentFactor: af,
+                Pump: pump_,
+                CGM: cgm.rawValue,
+                insulinType: insulin_type.rawValue,
+                peakActivityTime: iPa,
+                Carbs_24h: carbTotal,
+                GlucoseStorage_Days: Decimal(roundDouble(numberOfDays, 1)),
+                Statistics: Stats(
+                    Distribution: TimeInRange,
+                    Glucose: avg,
+                    HbA1c: hbs, Units: Units(Glucose: units.rawValue, HbA1c: hbA1cUnit),
+                    LoopCycles: loopstat,
+                    Insulin: insulin,
+                    Variance: variance
+                )
+            )
+            storage.save(dailystat, as: file)
+            nightscout.uploadStatistics(dailystat: dailystat)
+
             coredataContext.performAndWait { [self] in
-                var stats = [StatsData]()
-                let requestStats = StatsData.fetchRequest() as NSFetchRequest<StatsData>
-                let sortStats = NSSortDescriptor(key: "lastrun", ascending: false)
-                requestStats.sortDescriptors = [sortStats]
-                requestStats.fetchLimit = 1
-                try? stats = coredataContext.fetch(requestStats)
-                // Only save and upload once per day
-                guard (-1 * (stats.first?.lastrun ?? .distantPast).timeIntervalSinceNow.hours) > 22 else { return }
-
-                let units = self.settingsManager.settings.units
-                let preferences = settingsManager.preferences
-
-                var carbs = [Carbohydrates]()
-                var carbTotal: Decimal = 0
-                let requestCarbs = Carbohydrates.fetchRequest() as NSFetchRequest<Carbohydrates>
-                let daysAgo = Date().addingTimeInterval(-1.days.timeInterval)
-                requestCarbs.predicate = NSPredicate(format: "carbs > 0 AND date > %@", daysAgo as NSDate)
-
-                let sortCarbs = NSSortDescriptor(key: "date", ascending: true)
-                requestCarbs.sortDescriptors = [sortCarbs]
-                try? carbs = coredataContext.fetch(requestCarbs)
-
-                carbTotal = carbs.map({ carbs in carbs.carbs as? Decimal ?? 0 }).reduce(0, +)
-
-                var tdds = [TDD]()
-                var currentTDD: Decimal = 0
-                var tddTotalAverage: Decimal = 0
-
-                let requestTDD = TDD.fetchRequest() as NSFetchRequest<TDD>
-                let sort = NSSortDescriptor(key: "timestamp", ascending: false)
-                let daysOf14Ago = Date().addingTimeInterval(-14.days.timeInterval)
-                requestTDD.predicate = NSPredicate(format: "timestamp > %@", daysOf14Ago as NSDate)
-                requestTDD.sortDescriptors = [sort]
-                try? tdds = coredataContext.fetch(requestTDD)
-
-                if !tdds.isEmpty {
-                    currentTDD = tdds[0].tdd?.decimalValue ?? 0
-                    let tddArray = tdds.compactMap({ insulin in insulin.tdd as? Decimal ?? 0 })
-                    tddTotalAverage = tddArray.reduce(0, +) / Decimal(tddArray.count)
-                }
-
-                var algo_ = "Oref0"
-
-                if preferences.sigmoid, preferences.enableDynamicCR {
-                    algo_ = "Dynamic ISF + CR: Sigmoid"
-                } else if preferences.sigmoid, !preferences.enableDynamicCR {
-                    algo_ = "Dynamic ISF: Sigmoid"
-                } else if preferences.useNewFormula, preferences.enableDynamicCR {
-                    algo_ = "Dynamic ISF + CR: Logarithmic"
-                } else if preferences.useNewFormula, !preferences.sigmoid,!preferences.enableDynamicCR {
-                    algo_ = "Dynamic ISF: Logarithmic"
-                }
-
-                let af = preferences.adjustmentFactor
-                let insulin_type = preferences.curve
-                let buildDate = Bundle.main.buildDate
-                let version = Bundle.main.releaseVersionNumber
-                let build = Bundle.main.buildVersionNumber
-                let branch = Bundle.main.infoDictionary?["BuildBranch"] as? String ?? ""
-                let copyrightNotice_ = Bundle.main.infoDictionary?["NSHumanReadableCopyright"] as? String ?? ""
-                let pump_ = pumpManager?.localizedTitle ?? ""
-                let cgm = settingsManager.settings.cgm
-                let file = OpenAPS.Monitor.statistics
-                var iPa: Decimal = 75
-                if preferences.useCustomPeakTime {
-                    iPa = preferences.insulinPeakTime
-                } else if preferences.curve.rawValue == "rapid-acting" {
-                    iPa = 65
-                } else if preferences.curve.rawValue == "ultra-rapid" {
-                    iPa = 50
-                }
-
-                var lsr = [LoopStatRecord]()
-
-                let requestLSR = LoopStatRecord.fetchRequest() as NSFetchRequest<LoopStatRecord>
-                requestLSR.predicate = NSPredicate(
-                    format: "interval > 0 AND start > %@",
-                    Date().addingTimeInterval(-24.hours.timeInterval) as NSDate
-                )
-                let sortLSR = NSSortDescriptor(key: "start", ascending: false)
-                requestLSR.sortDescriptors = [sortLSR]
-
-                try? lsr = coredataContext.fetch(requestLSR)
-                let loops = lsr
-
-                let durationArray = loops.compactMap({ each in each.duration })
-                let durationArrayCount = durationArray.count
-                let successsNR = loops.compactMap({ each in each.loopStatus }).filter({ each in each!.contains("Success") }).count
-
-                let durationAverage = durationArray.reduce(0, +) / Double(durationArrayCount)
-                let medianDuration = medianCalculation(array: durationArray)
-                let minimumDuration = durationArray.min() ?? 0
-                let maximumDuration = durationArray.max() ?? 0
-                let errorNR = durationArrayCount - successsNR
-                let successRate: Double? = (Double(successsNR) / Double(successsNR + errorNR)) * 100
-                let loopNr = successsNR + errorNR
-
-                let intervalArray = loops.compactMap({ each in each.interval })
-                let intervalArrayCount = intervalArray.count
-                let intervalAverage = intervalArray.reduce(0, +) / Double(intervalArrayCount)
-                let intervalMedian = medianCalculation(array: intervalArray)
-                let maximumInterval = intervalArray.max() ?? 0
-                let minimumInterval = intervalArray.min() ?? 0
-
-                var glucose = [Readings]()
-
-                var firstElementTime = Date()
-                var lastElementTime = Date()
-                var currentIndexTime = Date()
-
-                var bg: Decimal = 0
-
-                var bgArray: [Double] = []
-                var bgArray_1_: [Double] = []
-                var bgArray_7_: [Double] = []
-                var bgArray_30_: [Double] = []
-
-                var bgArrayForTIR: [(bg_: Double, date_: Date)] = []
-                var bgArray_1: [(bg_: Double, date_: Date)] = []
-                var bgArray_7: [(bg_: Double, date_: Date)] = []
-                var bgArray_30: [(bg_: Double, date_: Date)] = []
-
-                var medianBG = 0.0
-                var nr_bgs: Decimal = 0
-                var bg_1: Decimal = 0
-                var bg_7: Decimal = 0
-                var bg_30: Decimal = 0
-                var bg_total: Decimal = 0
-                var j = -1
-                var conversionFactor: Decimal = 1
-                if units == .mmolL {
-                    conversionFactor = 0.0555
-                }
-
-                var numberOfDays: Double = 0
-                var nr1: Decimal = 0
-
-                let requestGFS = Readings.fetchRequest() as NSFetchRequest<Readings>
-                let sortGlucose = NSSortDescriptor(key: "date", ascending: false)
-                requestGFS.sortDescriptors = [sortGlucose]
-
-                try? glucose = coredataContext.fetch(requestGFS)
-
-                // Time In Range (%) and Average Glucose. This will be refactored later after some testing.
-                let endIndex = glucose.count - 1
-
-                firstElementTime = glucose[0].date ?? Date()
-                lastElementTime = glucose[endIndex].date ?? Date()
-
-                currentIndexTime = firstElementTime
-
-                numberOfDays = (firstElementTime - lastElementTime).timeInterval / 8.64E4
-
-                // Make arrays for median calculations and calculate averages
-                if endIndex >= 0, (glucose.first?.glucose ?? 0) != 0 {
-                    repeat {
-                        j += 1
-                        if glucose[j].glucose > 0 {
-                            currentIndexTime = glucose[j].date ?? firstElementTime
-                            bg += Decimal(glucose[j].glucose) * conversionFactor
-                            bgArray.append(Double(glucose[j].glucose) * Double(conversionFactor))
-                            bgArrayForTIR.append((Double(glucose[j].glucose), glucose[j].date!))
-                            nr_bgs += 1
-                            if (firstElementTime - currentIndexTime).timeInterval <= 8.64E4 { // 1 day
-                                bg_1 = bg / nr_bgs
-                                bgArray_1 = bgArrayForTIR
-                                bgArray_1_ = bgArray
-                                nr1 = nr_bgs
-                            }
-                            if (firstElementTime - currentIndexTime).timeInterval <= 6.048E5 { // 7 days
-                                bg_7 = bg / nr_bgs
-                                bgArray_7 = bgArrayForTIR
-                                bgArray_7_ = bgArray
-                            }
-                            if (firstElementTime - currentIndexTime).timeInterval <= 2.592E6 { // 30 days
-                                bg_30 = bg / nr_bgs
-                                bgArray_30 = bgArrayForTIR
-                                bgArray_30_ = bgArray
-                            }
-                        }
-                    } while j != glucose.count - 1
-                } else { return }
-
-                if nr_bgs > 0 {
-                    // Up to 91 days
-                    bg_total = bg / nr_bgs
-                }
-
-                // Total median
-                medianBG = medianCalculation(array: bgArray)
-
-                func tir(_ array: [(bg_: Double, date_: Date)]) -> (TIR: Double, hypos: Double, hypers: Double) {
-                    var timeInHypo = 0.0
-                    var timeInHyper = 0.0
-                    var hypos = 0.0
-                    var hypers = 0.0
-                    var i = -1
-                    var lastIndex = false
-                    let endIndex = array.count - 1
-
-                    let hypoLimit = settingsManager.settings.low
-                    let hyperLimit = settingsManager.settings.high
-
-                    var full_time = 0.0
-                    if endIndex > 0 {
-                        full_time = (array[0].date_ - array[endIndex].date_).timeInterval
-                    }
-                    while i < endIndex {
-                        i += 1
-                        let currentTime = array[i].date_
-                        var previousTime = currentTime
-                        if i + 1 <= endIndex {
-                            previousTime = array[i + 1].date_
-                        } else {
-                            lastIndex = true
-                        }
-                        if array[i].bg_ < Double(hypoLimit), !lastIndex {
-                            // Exclude duration between CGM readings which are more than 30 minutes
-                            timeInHypo += min((currentTime - previousTime).timeInterval, 30.minutes.timeInterval)
-                        } else if array[i].bg_ >= Double(hyperLimit), !lastIndex {
-                            timeInHyper += min((currentTime - previousTime).timeInterval, 30.minutes.timeInterval)
-                        }
-                    }
-                    if timeInHypo == 0.0 {
-                        hypos = 0
-                    } else if full_time != 0.0 { hypos = (timeInHypo / full_time) * 100
-                    }
-                    if timeInHyper == 0.0 {
-                        hypers = 0
-                    } else if full_time != 0.0 { hypers = (timeInHyper / full_time) * 100
-                    }
-                    let TIR = 100 - (hypos + hypers)
-                    return (roundDouble(TIR, 1), roundDouble(hypos, 1), roundDouble(hypers, 1))
-                }
-
-                // HbA1c estimation (%, mmol/mol) 1 day
-                var NGSPa1CStatisticValue: Decimal = 0.0
-                var IFCCa1CStatisticValue: Decimal = 0.0
-                if nr_bgs > 0 {
-                    NGSPa1CStatisticValue = ((bg_1 / conversionFactor) + 46.7) / 28.7 // NGSP (%)
-                    IFCCa1CStatisticValue = 10.929 *
-                        (NGSPa1CStatisticValue - 2.152) // IFCC (mmol/mol)  A1C(mmol/mol) = 10.929 * (A1C(%) - 2.15)
-                }
-                // 7 days
-                var NGSPa1CStatisticValue_7: Decimal = 0.0
-                var IFCCa1CStatisticValue_7: Decimal = 0.0
-                if nr_bgs > 0 {
-                    NGSPa1CStatisticValue_7 = ((bg_7 / conversionFactor) + 46.7) / 28.7
-                    IFCCa1CStatisticValue_7 = 10.929 * (NGSPa1CStatisticValue_7 - 2.152)
-                }
-                // 30 days
-                var NGSPa1CStatisticValue_30: Decimal = 0.0
-                var IFCCa1CStatisticValue_30: Decimal = 0.0
-                if nr_bgs > 0 {
-                    NGSPa1CStatisticValue_30 = ((bg_30 / conversionFactor) + 46.7) / 28.7
-                    IFCCa1CStatisticValue_30 = 10.929 * (NGSPa1CStatisticValue_30 - 2.152)
-                }
-                // Total days
-                var NGSPa1CStatisticValue_total: Decimal = 0.0
-                var IFCCa1CStatisticValue_total: Decimal = 0.0
-                if nr_bgs > 0 {
-                    NGSPa1CStatisticValue_total = ((bg_total / conversionFactor) + 46.7) / 28.7
-                    IFCCa1CStatisticValue_total = 10.929 *
-                        (NGSPa1CStatisticValue_total - 2.152)
-                }
-
-                let median = Durations(
-                    day: roundDecimal(Decimal(medianCalculation(array: bgArray_1_)), 1),
-                    week: roundDecimal(Decimal(medianCalculation(array: bgArray_7_)), 1),
-                    month: roundDecimal(Decimal(medianCalculation(array: bgArray_30_)), 1),
-                    total: roundDecimal(Decimal(medianBG), 1)
-                )
-
-                let saveMedianToCoreData = BGmedian(context: self.coredataContext)
-                saveMedianToCoreData.date = Date()
-                saveMedianToCoreData.median = median.total as NSDecimalNumber
-                saveMedianToCoreData.median_1 = median.day as NSDecimalNumber
-                saveMedianToCoreData.median_7 = median.week as NSDecimalNumber
-                saveMedianToCoreData.median_30 = median.month as NSDecimalNumber
-
-                try? self.coredataContext.save()
-
-                var hbs = Durations(
-                    day: roundDecimal(NGSPa1CStatisticValue, 1),
-                    week: roundDecimal(NGSPa1CStatisticValue_7, 1),
-                    month: roundDecimal(NGSPa1CStatisticValue_30, 1),
-                    total: roundDecimal(NGSPa1CStatisticValue_total, 1)
-                )
-
-                let saveHbA1c = HbA1c(context: self.coredataContext)
-                saveHbA1c.date = Date()
-                saveHbA1c.hba1c = NGSPa1CStatisticValue_total as NSDecimalNumber
-                saveHbA1c.hba1c_1 = NGSPa1CStatisticValue as NSDecimalNumber
-                saveHbA1c.hba1c_7 = NGSPa1CStatisticValue_7 as NSDecimalNumber
-                saveHbA1c.hba1c_30 = NGSPa1CStatisticValue_30 as NSDecimalNumber
-
-                try? self.coredataContext.save()
-
-                // Convert to user-preferred unit
-                let overrideHbA1cUnit = settingsManager.settings.overrideHbA1cUnit
-                if units == .mmolL {
-                    // Override if users sets overrideHbA1cUnit: true
-                    if !overrideHbA1cUnit {
-                        hbs = Durations(
-                            day: roundDecimal(IFCCa1CStatisticValue, 1),
-                            week: roundDecimal(IFCCa1CStatisticValue_7, 1),
-                            month: roundDecimal(IFCCa1CStatisticValue_30, 1),
-                            total: roundDecimal(IFCCa1CStatisticValue_total, 1)
-                        )
-                    }
-                } else if units != .mmolL, overrideHbA1cUnit {
-                    hbs = Durations(
-                        day: roundDecimal(IFCCa1CStatisticValue, 1),
-                        week: roundDecimal(IFCCa1CStatisticValue_7, 1),
-                        month: roundDecimal(IFCCa1CStatisticValue_30, 1),
-                        total: roundDecimal(IFCCa1CStatisticValue_total, 1)
-                    )
-                }
-
-                let nrOfCGMReadings = nr1
-
-                let loopstat = LoopCycles(
-                    loops: loopNr,
-                    errors: errorNR,
-                    readings: Int(nrOfCGMReadings),
-                    success_rate: Decimal(round(successRate ?? 0)),
-                    avg_interval: roundDecimal(Decimal(intervalAverage), 1),
-                    median_interval: roundDecimal(Decimal(intervalMedian), 1),
-                    min_interval: roundDecimal(Decimal(minimumInterval), 1),
-                    max_interval: roundDecimal(Decimal(maximumInterval), 1),
-                    avg_duration: Decimal(roundDouble(durationAverage, 2)),
-                    median_duration: Decimal(roundDouble(medianDuration, 2)),
-                    min_duration: roundDecimal(Decimal(minimumDuration), 2),
-                    max_duration: Decimal(roundDouble(maximumDuration, 1))
-                )
-
-                // TIR calcs for every case
-                var oneDay_: (TIR: Double, hypos: Double, hypers: Double) = (0.0, 0.0, 0.0)
-                var sevenDays_: (TIR: Double, hypos: Double, hypers: Double) = (0.0, 0.0, 0.0)
-                var thirtyDays_: (TIR: Double, hypos: Double, hypers: Double) = (0.0, 0.0, 0.0)
-                var totalDays_: (TIR: Double, hypos: Double, hypers: Double) = (0.0, 0.0, 0.0)
-
-                // Get all TIR calcs for every case
-                if nr_bgs > 0 {
-                    oneDay_ = tir(bgArray_1)
-                    sevenDays_ = tir(bgArray_7)
-                    thirtyDays_ = tir(bgArray_30)
-                    totalDays_ = tir(bgArrayForTIR)
-                }
-
-                let tir = Durations(
-                    day: roundDecimal(Decimal(oneDay_.TIR), 1),
-                    week: roundDecimal(Decimal(sevenDays_.TIR), 1),
-                    month: roundDecimal(Decimal(thirtyDays_.TIR), 1),
-                    total: roundDecimal(Decimal(totalDays_.TIR), 1)
-                )
-
-                let hypo = Durations(
-                    day: Decimal(oneDay_.hypos),
-                    week: Decimal(sevenDays_.hypos),
-                    month: Decimal(thirtyDays_.hypos),
-                    total: Decimal(totalDays_.hypos)
-                )
-
-                let hyper = Durations(
-                    day: Decimal(oneDay_.hypers),
-                    week: Decimal(sevenDays_.hypers),
-                    month: Decimal(thirtyDays_.hypers),
-                    total: Decimal(totalDays_.hypers)
-                )
-
-                let range = Threshold(
-                    low: units == .mmolL ? roundDecimal(settingsManager.settings.low.asMmolL, 1) :
-                        roundDecimal(settingsManager.settings.low, 0),
-                    high: units == .mmolL ? roundDecimal(settingsManager.settings.high.asMmolL, 1) :
-                        roundDecimal(settingsManager.settings.high, 0)
-                )
-
-                let TimeInRange = TIRs(
-                    TIR: tir,
-                    Hypos: hypo,
-                    Hypers: hyper,
-                    Threshold: range
-                )
-
-                let avgs = Durations(
-                    day: roundDecimal(bg_1, 1),
-                    week: roundDecimal(bg_7, 1),
-                    month: roundDecimal(bg_30, 1),
-                    total: roundDecimal(bg_total, 1)
-                )
-
-                let saveAverages = BGaverages(context: self.coredataContext)
-                saveAverages.date = Date()
-                saveAverages.average = bg_total as NSDecimalNumber
-                saveAverages.average_1 = bg_1 as NSDecimalNumber
-                saveAverages.average_7 = bg_7 as NSDecimalNumber
-                saveAverages.average_30 = bg_30 as NSDecimalNumber
-                try? self.coredataContext.save()
-
-                let avg = Averages(Average: avgs, Median: median)
-                var insulinDistribution = [InsulinDistribution]()
-
-                var insulin = Ins(
-                    TDD: 0,
-                    bolus: 0,
-                    temp_basal: 0,
-                    scheduled_basal: 0,
-                    total_average: 0
-                )
-
-                let requestInsulinDistribution = InsulinDistribution.fetchRequest() as NSFetchRequest<InsulinDistribution>
-                let sortInsulin = NSSortDescriptor(key: "date", ascending: false)
-                requestInsulinDistribution.sortDescriptors = [sortInsulin]
-
-                try? insulinDistribution = coredataContext.fetch(requestInsulinDistribution)
-
-                insulin = Ins(
-                    TDD: roundDecimal(currentTDD, 2),
-                    bolus: insulinDistribution.first != nil ? ((insulinDistribution.first?.bolus ?? 0) as Decimal) : 0,
-                    temp_basal: insulinDistribution.first != nil ? ((insulinDistribution.first?.tempBasal ?? 0) as Decimal) : 0,
-                    scheduled_basal: insulinDistribution
-                        .first != nil ? ((insulinDistribution.first?.scheduledBasal ?? 0) as Decimal) : 0,
-                    total_average: roundDecimal(tddTotalAverage, 1)
-                )
-
-                var sumOfSquares = 0.0
-                var sumOfSquares_1 = 0.0
-                var sumOfSquares_7 = 0.0
-                var sumOfSquares_30 = 0.0
-
-                // Total
-                for array in bgArray {
-                    sumOfSquares += pow(array - Double(bg_total), 2)
-                }
-                // One day
-                for array_1 in bgArray_1_ {
-                    sumOfSquares_1 += pow(array_1 - Double(bg_1), 2)
-                }
-                // week
-                for array_7 in bgArray_7_ {
-                    sumOfSquares_7 += pow(array_7 - Double(bg_7), 2)
-                }
-                // month
-                for array_30 in bgArray_30_ {
-                    sumOfSquares_30 += pow(array_30 - Double(bg_30), 2)
-                }
-
-                // Standard deviation and Coefficient of variation
-                var sd_total = 0.0
-                var cv_total = 0.0
-                var sd_1 = 0.0
-                var cv_1 = 0.0
-                var sd_7 = 0.0
-                var cv_7 = 0.0
-                var sd_30 = 0.0
-                var cv_30 = 0.0
-
-                // Avoid division by zero
-                if bg_total > 0 {
-                    sd_total = sqrt(sumOfSquares / Double(nr_bgs))
-                    cv_total = sd_total / Double(bg_total) * 100
-                }
-                if bg_1 > 0 {
-                    sd_1 = sqrt(sumOfSquares_1 / Double(bgArray_1_.count))
-                    cv_1 = sd_1 / Double(bg_1) * 100
-                }
-                if bg_7 > 0 {
-                    sd_7 = sqrt(sumOfSquares_7 / Double(bgArray_7_.count))
-                    cv_7 = sd_7 / Double(bg_7) * 100
-                }
-                if bg_30 > 0 {
-                    sd_30 = sqrt(sumOfSquares_30 / Double(bgArray_30_.count))
-                    cv_30 = sd_30 / Double(bg_30) * 100
-                }
-
-                // Standard Deviations
-                let standardDeviations = Durations(
-                    day: roundDecimal(Decimal(sd_1), 1),
-                    week: roundDecimal(Decimal(sd_7), 1),
-                    month: roundDecimal(Decimal(sd_30), 1),
-                    total: roundDecimal(Decimal(sd_total), 1)
-                )
-
-                // CV = standard deviation / sample mean x 100
-                let cvs = Durations(
-                    day: roundDecimal(Decimal(cv_1), 1),
-                    week: roundDecimal(Decimal(cv_7), 1),
-                    month: roundDecimal(Decimal(cv_30), 1),
-                    total: roundDecimal(Decimal(cv_total), 1)
-                )
-
-                let variance = Variance(SD: standardDeviations, CV: cvs)
-
-                let dailystat = Statistics(
-                    created_at: Date(),
-                    iPhone: UIDevice.current.getDeviceId,
-                    iOS: UIDevice.current.getOSInfo,
-                    Build_Version: version ?? "",
-                    Build_Number: build ?? "1",
-                    Branch: branch,
-                    CopyRightNotice: String(copyrightNotice_.prefix(32)),
-                    Build_Date: buildDate,
-                    Algorithm: algo_,
-                    AdjustmentFactor: af,
-                    Pump: pump_,
-                    CGM: cgm.rawValue,
-                    insulinType: insulin_type.rawValue,
-                    peakActivityTime: iPa,
-                    Carbs_24h: carbTotal,
-                    GlucoseStorage_Days: Decimal(roundDouble(numberOfDays, 1)),
-                    Statistics: Stats(
-                        Distribution: TimeInRange,
-                        Glucose: avg,
-                        HbA1c: hbs,
-                        LoopCycles: loopstat,
-                        Insulin: insulin,
-                        Variance: variance
-                    )
-                )
-
-                storage.save(dailystat, as: file)
-                nightscout.uploadStatistics(dailystat: dailystat)
-                nightscout.uploadPreferences()
-
                 let saveStatsCoreData = StatsData(context: self.coredataContext)
                 saveStatsCoreData.lastrun = Date()
                 try? self.coredataContext.save()
-                print("Test time of statistics computation: \(-1 * now.timeIntervalSinceNow) s")
             }
         }
     }
 
     private func loopStats(loopStatRecord: LoopStats) {
-        let LoopStatsStartedAt = Date()
-
         coredataContext.perform {
             let nLS = LoopStatRecord(context: self.coredataContext)
 
@@ -1301,8 +1250,6 @@ final class BaseAPSManager: APSManager, Injectable {
 
             try? self.coredataContext.save()
         }
-        print("LoopStatRecords: \(loopStatRecord)")
-        print("Test time of LoopStats computation: \(-1 * LoopStatsStartedAt.timeIntervalSinceNow) s")
     }
 
     private func processError(_ error: Error) {
@@ -1347,7 +1294,7 @@ private extension PumpManager {
                     debug(.apsManager, "Temp basal failed: \(unitsPerHour) for: \(duration)")
                     promise(.failure(error))
                 } else {
-                    debug(.apsManager, "Temp basal succeded: \(unitsPerHour) for: \(duration)")
+                    debug(.apsManager, "Temp basal succeeded: \(unitsPerHour) for: \(duration)")
                     promise(.success(nil))
                 }
             }
@@ -1366,7 +1313,7 @@ private extension PumpManager {
                     debug(.apsManager, "Bolus failed: \(units)")
                     promise(.failure(error))
                 } else {
-                    debug(.apsManager, "Bolus succeded: \(units)")
+                    debug(.apsManager, "Bolus succeeded: \(units)")
                     promise(.success(nil))
                 }
             }
@@ -1380,7 +1327,7 @@ private extension PumpManager {
             self.cancelBolus { result in
                 switch result {
                 case let .success(dose):
-                    debug(.apsManager, "Cancel Bolus succeded")
+                    debug(.apsManager, "Cancel Bolus succeeded")
                     promise(.success(dose))
                 case let .failure(error):
                     debug(.apsManager, "Cancel Bolus failed")

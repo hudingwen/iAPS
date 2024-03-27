@@ -293,6 +293,9 @@ Enact a temp Basal or a temp target */
 /**/
 "Use local glucose server" = "Use local glucose server";
 
+/* Enable Statistics */
+"This enables uploading of statistics.json to Nightscout, which can be used by the Community Statistics and Demographics Project.\n\nParticipation in Community Statistics is opt-in, and requires separate registration at:\n" = "This enables uploading of statistics.json to Nightscout, which can be used by the Community Statistics and Demographics Project.\n\nParticipation in Community Statistics is opt-in, and requires separate registration at:\n";
+
 /*  */
 "Edit settings json" = "Edit settings json";
 
@@ -452,8 +455,6 @@ Enact a temp Basal or a temp target */
 /* Lower target */
 "Low target" = "Low target";
 
-/*  */
-"Target Ranges" = "Target Ranges";
 
 /* When bolusing */
 "Bolusing" = "Bolusing";
@@ -492,10 +493,10 @@ Enact a temp Basal or a temp target */
 "Temp Targets" = "Temp Targets";
 
 /* Delete carbs from data table and Nightscout */
-"Delete carbs?" = "Delete carbs?";
+"Delete Carbs?" = "Delete Carbs?";
 
 /* Delete insulin from pump history and Nightscout */
-"Delete insulin?" = "Delete insulin?";
+"Delete Insulin?" = "Delete Insulin?";
 
 /* Treatments list */
 "Treatments" = "Treatments";
@@ -516,7 +517,7 @@ Enact a temp Basal or a temp target */
 "Calibrations" = "Calibrations";
 
 /* */
-"Create events in calendar" = "Create events in calendar";
+"Create Events in Calendar" = "Create Events in Calendar";
 
 /* */
 "Calendar" = "Calendar";
@@ -942,7 +943,7 @@ Enact a temp Basal or a temp target */
 "iAPS not active" = "iAPS not active";
 
 /* */
-"Last loop was more then %d min ago" = "Last loop was more then %d min ago";
+"Last loop was more than %d min ago" = "Last loop was more than %d min ago";
 
 /* Glucose badge */
 "Show glucose on the app badge" = "Show glucose on the app badge";
@@ -1087,7 +1088,7 @@ Enact a temp Basal or a temp target */
 "For write data to Apple Health you must give permissions in Settings > Health > Data Access" = "For write data to Apple Health you must give permissions in Settings > Health > Data Access";
 
 /* */
-"After you create glucose records in the Health app, please open iAPS to help us guaranteed transfer changed data" = "After you create glucose records in the Health app, please open iAPS to help us guaranteed transfer changed data";
+"This allows iAPS to read from and write to Apple Heath. You must also give permissions in Settings > Health > Data Access. If you enter a glucose value into Apple Health, open iAPS to confirm it shows up." = "This allows iAPS to read from and write to Apple Heath. You must also give permissions in Settings > Health > Data Access. If you enter a glucose value into Apple Health, open iAPS to confirm it shows up.";
 
 /* New ALerts ------------------------- */
 /* Info title */
@@ -1252,7 +1253,7 @@ Enact a temp Basal or a temp target */
 "Statistics and Home View" = "Statistics and Home View";
 
 /* Alert text */
-"Delete carb equivalents?" = "Delete carb equivalents?";
+"Delete Carb Equivalents?" = "Delete Carb Equivalents?";
 
 /* */
 "Meal Presets" = "Meal Presets";
@@ -1293,7 +1294,7 @@ Enact a temp Basal or a temp target */
 /* Text for confidence reminders navigation link */
 "Confidence Reminders" = "Confidence Reminders";
 
-"Confidence reminders are beeps from the pod which can be used to acknowledge selected commands." = "Confidence reminders are beeps from the pod which can be used to acknowledge selected commands.";
+"Confidence reminders are beeps from the Pod which can be used to acknowledge selected commands when the Pod is not silenced." = "Confidence reminders are beeps from the Pod which can be used to acknowledge selected commands when the Pod is not silenced.";
 
 /* button title for saving low reservoir reminder while saving */
 "Saving..." = "Saving...";
@@ -1323,10 +1324,10 @@ Enact a temp Basal or a temp target */
 "No confidence reminders are used." = "No confidence reminders are used.";
 
 /* Description for BeepPreference.manualCommands */
-"Confidence reminders will sound for commands you initiate, like bolus, cancel bolus, suspend, resume, save notification reminders, etc. When Loop automatically adjusts delivery, no confidence reminders are used." = "Confidence reminders will sound for commands you initiate, like bolus, cancel bolus, suspend, resume, save notification reminders, etc. When Loop automatically adjusts delivery, no confidence reminders are used.";
+"Confidence reminders will sound for commands you initiate, like bolus, cancel bolus, suspend, resume, save notification reminders, etc. When the app automatically adjusts delivery, no confidence reminders are used." = "Confidence reminders will sound for commands you initiate, like bolus, cancel bolus, suspend, resume, save notification reminders, etc. When the app automatically adjusts delivery, no confidence reminders are used.";
 
 /* Description for BeepPreference.extended */
-"Confidence reminders will sound when Loop automatically adjusts delivery as well as for commands you initiate." = "Confidence reminders will sound when Loop automatically adjusts delivery as well as for commands you initiate.";
+"Confidence reminders will sound when the app automatically adjusts delivery as well as for commands you initiate." = "Confidence reminders will sound when the app automatically adjusts delivery as well as for commands you initiate.";
 
 /* Label text for expiration reminder default row */
 "Expiration Reminder Default" = "Expiration Reminder Default";
@@ -1472,7 +1473,7 @@ Enact a temp Basal or a temp target */
 "Median" = "Median";
 
 /* CGM readings in statView */
-"Readings today" = "Readings today";
+"Readings" = "Readings";
 
 /* CGM readings in statView */
 "Readings / 24h" = "Readings / 24h";
@@ -1729,7 +1730,7 @@ Enact a temp Basal or a temp target */
 "Max COB" = "Max COB";
 
 /* "Max COB" */
-"This defaults maxCOB to 120 because that’s the most a typical body can absorb over 4 hours. (If someone enters more carbs or stacks more; OpenAPS will just truncate dosing based on 120. Essentially, this just limits AMA as a safety cap against weird COB calculations due to fluky data.)" = "This defaults maxCOB to 120 because that’s the most a typical body can absorb over 4 hours. (If someone enters more carbs or stacks more; OpenAPS will just truncate dosing based on 120. Essentially, this just limits AMA as a safety cap against weird COB calculations due to fluky data.)";
+"The default of maxCOB is 120. (If someone enters more carbs in one or multiple entries, iAPS will cap COB to maxCOB and keep it at maxCOB until the carbs entered above maxCOB have shown to be absorbed. Essentially, this just limits UAM as a safety cap against weird COB calculations due to fluky data.)" = "The default of maxCOB is 120. (If someone enters more carbs in one or multiple entries, iAPS will cap COB to maxCOB and keep it at maxCOB until the carbs entered above maxCOB have shown to be absorbed. Essentially, this just limits UAM as a safety cap against weird COB calculations due to fluky data.)";
 
 /* Headline "Bolus Snooze DIA Divisor" */
 "Bolus Snooze DIA Divisor" = "Bolus Snooze DIA Divisor";

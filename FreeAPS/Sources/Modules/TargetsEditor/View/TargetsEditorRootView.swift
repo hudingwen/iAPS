@@ -38,8 +38,9 @@ extension TargetsEditor {
                     .disabled(state.items.isEmpty)
                 }
             }
+            .dynamicTypeSize(...DynamicTypeSize.xxLarge)
             .onAppear(perform: configureView)
-            .navigationTitle("Target Ranges")
+            .navigationTitle("Target Glucose")
             .navigationBarTitleDisplayMode(.automatic)
             .navigationBarItems(
                 trailing: EditButton()

@@ -15,6 +15,8 @@ struct FreeAPSSettings: JSON, Equatable {
     var cgm: CGMType = .nightscout
     var uploadGlucose: Bool = true
     var useCalendar: Bool = false
+    var displayCalendarIOBandCOB: Bool = false
+    var displayCalendarEmojis: Bool = false
     var glucoseBadge: Bool = false
     var glucoseNotificationsAlways: Bool = false
     var useAlarmSound: Bool = false
@@ -40,6 +42,22 @@ struct FreeAPSSettings: JSON, Equatable {
     var yGridLines: Bool = true
     var oneDimensionalGraph: Bool = false
     var rulerMarks: Bool = false
+    var maxCarbs: Decimal = 1000
+    var displayFatAndProteinOnWatch: Bool = false
+    var confirmBolusFaster: Bool = false
+    var onlyAutotuneBasals: Bool = false
+    var overrideFactor: Decimal = 0.8
+    var useCalc: Bool = false
+    var fattyMeals: Bool = false
+    var fattyMealFactor: Decimal = 0.7
+    var displayPredictions: Bool = true
+    var useLiveActivity: Bool = false
+    var useTargetButton: Bool = false
+    var alwaysUseColors: Bool = true
+    var timeSettings: Bool = true
+    var profilesOrTempTargets: Bool = false
+    var allowBolusShortcut: Bool = false
+    var allowedRemoteBolusAmount: Decimal = 0.0
 }
 
 extension FreeAPSSettings: Decodable {
@@ -110,6 +128,14 @@ extension FreeAPSSettings: Decodable {
             settings.useCalendar = useCalendar
         }
 
+        if let displayCalendarIOBandCOB = try? container.decode(Bool.self, forKey: .displayCalendarIOBandCOB) {
+            settings.displayCalendarIOBandCOB = displayCalendarIOBandCOB
+        }
+
+        if let displayCalendarEmojis = try? container.decode(Bool.self, forKey: .displayCalendarEmojis) {
+            settings.displayCalendarEmojis = displayCalendarEmojis
+        }
+
         if let useAppleHealth = try? container.decode(Bool.self, forKey: .useAppleHealth) {
             settings.useAppleHealth = useAppleHealth
         }
@@ -124,6 +150,22 @@ extension FreeAPSSettings: Decodable {
 
         if let individualAdjustmentFactor = try? container.decode(Decimal.self, forKey: .individualAdjustmentFactor) {
             settings.individualAdjustmentFactor = individualAdjustmentFactor
+        }
+
+        if let useCalc = try? container.decode(Bool.self, forKey: .useCalc) {
+            settings.useCalc = useCalc
+        }
+
+        if let fattyMeals = try? container.decode(Bool.self, forKey: .fattyMeals) {
+            settings.fattyMeals = fattyMeals
+        }
+
+        if let fattyMealFactor = try? container.decode(Decimal.self, forKey: .fattyMealFactor) {
+            settings.fattyMealFactor = fattyMealFactor
+        }
+
+        if let overrideFactor = try? container.decode(Decimal.self, forKey: .overrideFactor) {
+            settings.overrideFactor = overrideFactor
         }
 
         if let timeCap = try? container.decode(Int.self, forKey: .timeCap) {
@@ -207,6 +249,54 @@ extension FreeAPSSettings: Decodable {
 
         if let overrideHbA1cUnit = try? container.decode(Bool.self, forKey: .overrideHbA1cUnit) {
             settings.overrideHbA1cUnit = overrideHbA1cUnit
+        }
+
+        if let maxCarbs = try? container.decode(Decimal.self, forKey: .maxCarbs) {
+            settings.maxCarbs = maxCarbs
+        }
+
+        if let displayFatAndProteinOnWatch = try? container.decode(Bool.self, forKey: .displayFatAndProteinOnWatch) {
+            settings.displayFatAndProteinOnWatch = displayFatAndProteinOnWatch
+        }
+
+        if let confirmBolusFaster = try? container.decode(Bool.self, forKey: .confirmBolusFaster) {
+            settings.confirmBolusFaster = confirmBolusFaster
+        }
+
+        if let onlyAutotuneBasals = try? container.decode(Bool.self, forKey: .onlyAutotuneBasals) {
+            settings.onlyAutotuneBasals = onlyAutotuneBasals
+        }
+
+        if let displayPredictions = try? container.decode(Bool.self, forKey: .displayPredictions) {
+            settings.displayPredictions = displayPredictions
+        }
+
+        if let useLiveActivity = try? container.decode(Bool.self, forKey: .useLiveActivity) {
+            settings.useLiveActivity = useLiveActivity
+        }
+
+        if let useTargetButton = try? container.decode(Bool.self, forKey: .useTargetButton) {
+            settings.useTargetButton = useTargetButton
+        }
+
+        if let alwaysUseColors = try? container.decode(Bool.self, forKey: .alwaysUseColors) {
+            settings.alwaysUseColors = alwaysUseColors
+        }
+
+        if let timeSettings = try? container.decode(Bool.self, forKey: .timeSettings) {
+            settings.timeSettings = timeSettings
+        }
+
+        if let profilesOrTempTargets = try? container.decode(Bool.self, forKey: .profilesOrTempTargets) {
+            settings.profilesOrTempTargets = profilesOrTempTargets
+        }
+
+        if let allowBolusShortcut = try? container.decode(Bool.self, forKey: .allowBolusShortcut) {
+            settings.allowBolusShortcut = allowBolusShortcut
+        }
+
+        if let allowedRemoteBolusAmount = try? container.decode(Decimal.self, forKey: .allowedRemoteBolusAmount) {
+            settings.allowedRemoteBolusAmount = allowedRemoteBolusAmount
         }
 
         self = settings
